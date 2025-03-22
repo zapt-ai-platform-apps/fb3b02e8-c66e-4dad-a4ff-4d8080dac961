@@ -69,7 +69,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'Server configuration error' });
     }
 
-    // Call Google Vision API
+    // Call Google Vision API with expanded feature requests
     const visionResponse = await fetch(
       `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
       {
@@ -86,11 +86,11 @@ export default async function handler(req, res) {
               features: [
                 {
                   type: 'LABEL_DETECTION',
-                  maxResults: 10,
+                  maxResults: 15,
                 },
                 {
                   type: 'OBJECT_LOCALIZATION',
-                  maxResults: 5,
+                  maxResults: 10,
                 },
                 {
                   type: 'IMAGE_PROPERTIES',
@@ -98,8 +98,24 @@ export default async function handler(req, res) {
                 },
                 {
                   type: 'TEXT_DETECTION',
+                  maxResults: 10,
+                },
+                {
+                  type: 'FACE_DETECTION',
                   maxResults: 5,
                 },
+                {
+                  type: 'LANDMARK_DETECTION',
+                  maxResults: 5,
+                },
+                {
+                  type: 'LOGO_DETECTION',
+                  maxResults: 5,
+                },
+                {
+                  type: 'WEB_DETECTION',
+                  maxResults: 5,
+                }
               ],
             },
           ],
@@ -128,7 +144,7 @@ export default async function handler(req, res) {
     // Clean up the temporary file
     fs.unlinkSync(imagePath);
 
-    return res.status(200).json({ description });
+    return res.status(200).json({ description, detailedAnalysis: response });
   } catch (error) {
     console.error('Error processing image:', error);
     Sentry.captureException(error);
@@ -140,22 +156,86 @@ function generateDescription(visionResponse) {
   try {
     let description = '';
     
-    // Get image labels
+    // Extract scene type/context
     const labels = visionResponse.labelAnnotations || [];
-    if (labels.length > 0) {
-      const mainSubjects = labels.slice(0, 3).map(label => label.description).join(', ');
-      description += `This image shows ${mainSubjects}. `;
+    const contexts = labels.filter(label => 
+      ['indoor', 'outdoor', 'city', 'rural', 'landscape', 'portrait', 'closeup', 'macro'].includes(label.description.toLowerCase())
+    );
+    
+    if (contexts.length > 0) {
+      description += `This appears to be an ${contexts[0].description.toLowerCase()} image. `;
     }
     
-    // Get objects
+    // Get image categories and themes
+    if (labels.length > 0) {
+      const mainSubjects = labels.slice(0, 4).map(label => label.description).join(', ');
+      description += `The image shows ${mainSubjects}. `;
+    }
+    
+    // Detect landmarks
+    const landmarks = visionResponse.landmarkAnnotations || [];
+    if (landmarks.length > 0) {
+      description += `The image features ${landmarks[0].description}`;
+      if (landmarks[0].locations && landmarks[0].locations.length > 0) {
+        const lat = landmarks[0].locations[0].latLng.latitude;
+        const lng = landmarks[0].locations[0].latLng.longitude;
+        description += `, located at approximately ${Math.abs(lat)}° ${lat >= 0 ? 'North' : 'South'}, ${Math.abs(lng)}° ${lng >= 0 ? 'East' : 'West'}`;
+      }
+      description += '. ';
+    }
+    
+    // Detect people and faces
+    const faceAnnotations = visionResponse.faceAnnotations || [];
+    if (faceAnnotations.length > 0) {
+      description += `There ${faceAnnotations.length === 1 ? 'is' : 'are'} ${faceAnnotations.length} ${faceAnnotations.length === 1 ? 'person' : 'people'} in the image. `;
+      
+      // Extract emotions
+      const emotionCounts = { joy: 0, sorrow: 0, anger: 0, surprise: 0 };
+      faceAnnotations.forEach(face => {
+        if (face.joyLikelihood === 'VERY_LIKELY' || face.joyLikelihood === 'LIKELY') emotionCounts.joy++;
+        if (face.sorrowLikelihood === 'VERY_LIKELY' || face.sorrowLikelihood === 'LIKELY') emotionCounts.sorrow++;
+        if (face.angerLikelihood === 'VERY_LIKELY' || face.angerLikelihood === 'LIKELY') emotionCounts.anger++;
+        if (face.surpriseLikelihood === 'VERY_LIKELY' || face.surpriseLikelihood === 'LIKELY') emotionCounts.surprise++;
+      });
+      
+      const emotions = Object.entries(emotionCounts)
+        .filter(([_, count]) => count > 0)
+        .map(([emotion, count]) => `${count} ${count === 1 ? 'appears' : 'appear'} to be ${emotion === 'joy' ? 'happy' : emotion}`);
+      
+      if (emotions.length > 0) {
+        description += `Of these, ${emotions.join(', ')}. `;
+      }
+    }
+    
+    // Get objects with their locations
     const objects = visionResponse.localizedObjectAnnotations || [];
     if (objects.length > 0) {
-      description += 'It contains ';
-      description += objects.map((obj, index) => {
-        const article = 'aeiou'.includes(obj.name[0].toLowerCase()) ? 'an' : 'a';
-        return `${index > 0 ? (index === objects.length - 1 ? ' and ' : ', ') : ''}${article} ${obj.name.toLowerCase()}`;
-      }).join('');
-      description += '. ';
+      // Group similar objects
+      const objectCounts = objects.reduce((acc, obj) => {
+        acc[obj.name] = (acc[obj.name] || 0) + 1;
+        return acc;
+      }, {});
+      
+      const objectDescriptions = Object.entries(objectCounts).map(([name, count]) => {
+        return count > 1 ? `${count} ${name.toLowerCase()}s` : `a ${name.toLowerCase()}`;
+      });
+      
+      if (objectDescriptions.length > 0) {
+        description += `The image contains ${objectDescriptions.join(', ')}. `;
+        
+        // Describe spatial relationships for multiple objects
+        if (objects.length >= 2) {
+          // We could add relative positioning (e.g., "The cat is to the left of the dog")
+          // But this would require more complex analysis of bounding boxes
+        }
+      }
+    }
+    
+    // Detect logos
+    const logos = visionResponse.logoAnnotations || [];
+    if (logos.length > 0) {
+      const logoNames = logos.map(logo => logo.description).join(', ');
+      description += `The image contains the following ${logos.length === 1 ? 'logo' : 'logos'}: ${logoNames}. `;
     }
     
     // Get colors
@@ -182,6 +262,31 @@ function generateDescription(visionResponse) {
       }
     }
     
+    // Web entities and similar images
+    const webDetection = visionResponse.webDetection || {};
+    const webEntities = webDetection.webEntities || [];
+    
+    if (webEntities.length > 0) {
+      const topEntities = webEntities
+        .filter(entity => entity.score > 0.5)
+        .slice(0, 3)
+        .map(entity => entity.description);
+        
+      if (topEntities.length > 0) {
+        description += `The image is associated with ${topEntities.join(', ')}. `;
+      }
+    }
+    
+    // Add image quality assessment
+    if (visionResponse.imageQualityAnnotation) {
+      const quality = visionResponse.imageQualityAnnotation.quality;
+      if (quality > 0.8) {
+        description += "This is a high-quality image. ";
+      } else if (quality < 0.4) {
+        description += "The image quality is relatively low. ";
+      }
+    }
+    
     // If description is empty (no data from API), provide a fallback
     if (!description) {
       description = 'This image could not be analyzed in detail. Please try uploading a clearer image.';
@@ -196,17 +301,39 @@ function generateDescription(visionResponse) {
 }
 
 function getColorName(red, green, blue) {
-  // Simple color naming algorithm
-  if (red > 200 && green < 100 && blue < 100) return 'red';
-  if (red < 100 && green > 200 && blue < 100) return 'green';
-  if (red < 100 && green < 100 && blue > 200) return 'blue';
-  if (red > 200 && green > 200 && blue < 100) return 'yellow';
-  if (red > 200 && green < 100 && blue > 200) return 'magenta';
-  if (red < 100 && green > 200 && blue > 200) return 'cyan';
-  if (red > 200 && green > 150 && blue > 100) return 'orange';
-  if (red > 200 && green < 100 && blue > 150) return 'purple';
-  if (red > 200 && green > 200 && blue > 200) return 'white';
-  if (red < 100 && green < 100 && blue < 100) return 'black';
-  if (red > 100 && red < 200 && green > 100 && green < 200 && blue > 100 && blue < 200) return 'gray';
+  // More sophisticated color naming algorithm
+  if (red > 220 && green > 220 && blue > 220) return 'white';
+  if (red < 30 && green < 30 && blue < 30) return 'black';
+  
+  // Primary colors
+  if (red > 200 && green < 70 && blue < 70) return 'red';
+  if (red < 70 && green > 200 && blue < 70) return 'green';
+  if (red < 70 && green < 70 && blue > 200) return 'blue';
+  
+  // Secondary colors
+  if (red > 200 && green > 200 && blue < 70) return 'yellow';
+  if (red > 200 && green < 70 && blue > 200) return 'magenta';
+  if (red < 70 && green > 200 && blue > 200) return 'cyan';
+  
+  // Tertiary colors
+  if (red > 200 && green > 120 && green < 180 && blue < 70) return 'orange';
+  if (red > 120 && red < 200 && green < 70 && blue > 200) return 'purple';
+  if (red > 70 && red < 120 && green > 200 && blue < 70) return 'lime';
+  if (red < 70 && green > 130 && green < 200 && blue > 200) return 'teal';
+  if (red > 200 && green < 70 && blue > 130 && blue < 200) return 'pink';
+  if (red > 150 && green > 150 && blue < 70) return 'gold';
+  
+  // Gray shades
+  if (Math.abs(red - green) < 30 && Math.abs(red - blue) < 30 && Math.abs(green - blue) < 30) {
+    if (red < 80) return 'dark gray';
+    if (red < 150) return 'gray';
+    return 'light gray';
+  }
+  
+  // Brown tones
+  if (red > 130 && red < 200 && green > 70 && green < 130 && blue < 70) {
+    return 'brown';
+  }
+  
   return 'mixed';
 }
